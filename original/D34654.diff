@@ -1,0 +1,231 @@
+Index: clang-tidy/ClangTidyDiagnosticConsumer.h
+===================================================================
+--- clang-tidy/ClangTidyDiagnosticConsumer.h
++++ clang-tidy/ClangTidyDiagnosticConsumer.h
+@@ -247,6 +247,10 @@
+   /// context.
+   llvm::Regex *getHeaderFilter();
+ 
++  /// \brief Returns the \c ExcludeHeaderFilter constructed for the options set
++  /// in the context.
++  llvm::Regex *getExcludeHeaderFilter();
++
+   /// \brief Updates \c LastErrorRelatesToUserCode and LastErrorPassesLineFilter
+   /// according to the diagnostic \p Location.
+   void checkFilters(SourceLocation Location);
+@@ -257,6 +261,7 @@
+   std::unique_ptr<DiagnosticsEngine> Diags;
+   SmallVector<ClangTidyError, 8> Errors;
+   std::unique_ptr<llvm::Regex> HeaderFilter;
++  std::unique_ptr<llvm::Regex> ExcludeHeaderFilter;
+   bool LastErrorRelatesToUserCode;
+   bool LastErrorPassesLineFilter;
+   bool LastErrorWasIgnored;
+Index: clang-tidy/ClangTidyDiagnosticConsumer.cpp
+===================================================================
+--- clang-tidy/ClangTidyDiagnosticConsumer.cpp
++++ clang-tidy/ClangTidyDiagnosticConsumer.cpp
+@@ -473,7 +473,8 @@
+   StringRef FileName(File->getName());
+   LastErrorRelatesToUserCode = LastErrorRelatesToUserCode ||
+                                Sources.isInMainFile(Location) ||
+-                               getHeaderFilter()->match(FileName);
++                               (getHeaderFilter()->match(FileName) &&
++                                !getExcludeHeaderFilter()->match(FileName));
+ 
+   unsigned LineNumber = Sources.getExpansionLineNumber(Location);
+   LastErrorPassesLineFilter =
+@@ -487,6 +488,13 @@
+   return HeaderFilter.get();
+ }
+ 
++llvm::Regex *ClangTidyDiagnosticConsumer::getExcludeHeaderFilter() {
++  if (!ExcludeHeaderFilter)
++    ExcludeHeaderFilter =
++        llvm::make_unique<llvm::Regex>(*Context.getOptions().ExcludeHeaderFilterRegex);
++  return ExcludeHeaderFilter.get();
++}
++
+ void ClangTidyDiagnosticConsumer::removeIncompatibleErrors(
+     SmallVectorImpl<ClangTidyError> &Errors) const {
+   // Each error is modelled as the set of intervals in which it applies
+Index: clang-tidy/ClangTidyOptions.h
+===================================================================
+--- clang-tidy/ClangTidyOptions.h
++++ clang-tidy/ClangTidyOptions.h
+@@ -69,6 +69,10 @@
+   /// main files will always be displayed.
+   llvm::Optional<std::string> HeaderFilterRegex;
+ 
++  /// \brief Exclude warnings from headers matching this filter, even if they
++  /// match \c HeaderFilterRegex.
++  llvm::Optional<std::string> ExcludeHeaderFilterRegex;
++
+   /// \brief Output warnings from system headers matching \c HeaderFilterRegex.
+   llvm::Optional<bool> SystemHeaders;
+ 
+Index: clang-tidy/ClangTidyOptions.cpp
+===================================================================
+--- clang-tidy/ClangTidyOptions.cpp
++++ clang-tidy/ClangTidyOptions.cpp
+@@ -86,6 +86,7 @@
+     IO.mapOptional("Checks", Options.Checks);
+     IO.mapOptional("WarningsAsErrors", Options.WarningsAsErrors);
+     IO.mapOptional("HeaderFilterRegex", Options.HeaderFilterRegex);
++    IO.mapOptional("ExcludeHeaderFilterRegex", Options.ExcludeHeaderFilterRegex);
+     IO.mapOptional("AnalyzeTemporaryDtors", Options.AnalyzeTemporaryDtors);
+     IO.mapOptional("FormatStyle", Options.FormatStyle);
+     IO.mapOptional("User", Options.User);
+@@ -106,6 +107,7 @@
+   Options.Checks = "";
+   Options.WarningsAsErrors = "";
+   Options.HeaderFilterRegex = "";
++  Options.ExcludeHeaderFilterRegex = "";
+   Options.SystemHeaders = false;
+   Options.AnalyzeTemporaryDtors = false;
+   Options.FormatStyle = "none";
+@@ -146,6 +148,7 @@
+   mergeCommaSeparatedLists(Result.Checks, Other.Checks);
+   mergeCommaSeparatedLists(Result.WarningsAsErrors, Other.WarningsAsErrors);
+   overrideValue(Result.HeaderFilterRegex, Other.HeaderFilterRegex);
++  overrideValue(Result.ExcludeHeaderFilterRegex, Other.ExcludeHeaderFilterRegex);
+   overrideValue(Result.SystemHeaders, Other.SystemHeaders);
+   overrideValue(Result.AnalyzeTemporaryDtors, Other.AnalyzeTemporaryDtors);
+   overrideValue(Result.FormatStyle, Other.FormatStyle);
+Index: clang-tidy/tool/ClangTidyMain.cpp
+===================================================================
+--- clang-tidy/tool/ClangTidyMain.cpp
++++ clang-tidy/tool/ClangTidyMain.cpp
+@@ -40,6 +40,7 @@
+     Checks:          '-*,some-check'
+     WarningsAsErrors: ''
+     HeaderFilterRegex: ''
++    ExcludeHeaderFilterRegex: ''
+     AnalyzeTemporaryDtors: false
+     FormatStyle:     none
+     User:            user
+@@ -89,6 +90,19 @@
+                                          cl::init(""),
+                                          cl::cat(ClangTidyCategory));
+ 
++static cl::opt<std::string>
++    ExcludeHeaderFilter("exclude-header-filter", cl::desc(R"(
++Regular expression matching the names of the
++headers to exclude when outputting diagnostics.
++Diagnostics from the main file of each translation
++unit are always displayed.
++Can be used together with -line-filter.
++This option overrides the 'ExcludeHeaderFilter' option
++in .clang-tidy file, if any.
++)"),
++                                         cl::init(""),
++                                         cl::cat(ClangTidyCategory));
++
+ static cl::opt<bool>
+     SystemHeaders("system-headers",
+                   cl::desc("Display the errors from system headers."),
+@@ -233,9 +247,10 @@
+                    << " with check filters";
+     llvm::errs() << ").\n";
+     if (Stats.ErrorsIgnoredNonUserCode)
+-      llvm::errs() << "Use -header-filter=.* to display errors from all "
+-                      "non-system headers. Use -system-headers to display "
+-                      "errors from system headers as well.\n";
++      llvm::errs() << "Use -header-filter=.* -exclude-header-filter='' to "
++                      "display errors from all non-system headers. Use "
++                      "-system-headers to display errors from system headers "
++                      "as well.\n";
+   }
+ }
+ 
+@@ -290,6 +305,7 @@
+   DefaultOptions.Checks = DefaultChecks;
+   DefaultOptions.WarningsAsErrors = "";
+   DefaultOptions.HeaderFilterRegex = HeaderFilter;
++  DefaultOptions.ExcludeHeaderFilterRegex = ExcludeHeaderFilter;
+   DefaultOptions.SystemHeaders = SystemHeaders;
+   DefaultOptions.AnalyzeTemporaryDtors = AnalyzeTemporaryDtors;
+   DefaultOptions.FormatStyle = FormatStyle;
+@@ -305,6 +321,8 @@
+     OverrideOptions.WarningsAsErrors = WarningsAsErrors;
+   if (HeaderFilter.getNumOccurrences() > 0)
+     OverrideOptions.HeaderFilterRegex = HeaderFilter;
++  if (ExcludeHeaderFilter.getNumOccurrences() > 0)
++    OverrideOptions.ExcludeHeaderFilterRegex = ExcludeHeaderFilter;
+   if (SystemHeaders.getNumOccurrences() > 0)
+     OverrideOptions.SystemHeaders = SystemHeaders;
+   if (AnalyzeTemporaryDtors.getNumOccurrences() > 0)
+Index: docs/clang-tidy/index.rst
+===================================================================
+--- docs/clang-tidy/index.rst
++++ docs/clang-tidy/index.rst
+@@ -240,6 +240,7 @@
+       Checks:          '-*,some-check'
+       WarningsAsErrors: ''
+       HeaderFilterRegex: ''
++      ExcludeHeaderFilterRegex: ''
+       AnalyzeTemporaryDtors: false
+       FormatStyle:     none
+       User:            user
+Index: test/clang-tidy/file-filter.cpp
+===================================================================
+--- test/clang-tidy/file-filter.cpp
++++ test/clang-tidy/file-filter.cpp
+@@ -9,6 +9,7 @@
+ //       file-filter\header*.h due to code order between '/' and '\\'.
+ // RUN: clang-tidy -checks='-*,google-explicit-constructor' -header-filter='.*' -system-headers %s -- -I %S/Inputs/file-filter/system/.. -isystem %S/Inputs/file-filter/system 2>&1 | FileCheck --check-prefix=CHECK4 %s
+ // RUN: clang-tidy -checks='-*,google-explicit-constructor' -header-filter='.*' -system-headers -quiet %s -- -I %S/Inputs/file-filter/system/.. -isystem %S/Inputs/file-filter/system 2>&1 | FileCheck --check-prefix=CHECK4-QUIET %s
++// RUN: clang-tidy -checks='-*,google-explicit-constructor' -header-filter='.*' -exclude-header-filter='header1\.h' %s -- -I %S/Inputs/file-filter -isystem %S/Inputs/file-filter/system 2>&1 | FileCheck --check-prefix=CHECK5 %s
+ 
+ #include "header1.h"
+ // CHECK-NOT: warning:
+@@ -19,6 +20,7 @@
+ // CHECK3-QUIET-NOT: warning:
+ // CHECK4: header1.h:1:12: warning: single-argument constructors
+ // CHECK4-QUIET: header1.h:1:12: warning: single-argument constructors
++// CHECK5-NOT: warning:
+ 
+ #include "header2.h"
+ // CHECK-NOT: warning:
+@@ -29,6 +31,7 @@
+ // CHECK3-QUIET: header2.h:1:12: warning: single-argument constructors
+ // CHECK4: header2.h:1:12: warning: single-argument constructors
+ // CHECK4-QUIET: header2.h:1:12: warning: single-argument constructors
++// CHECK5: header2.h:1:12: warning: single-argument constructors
+ 
+ #include <system-header.h>
+ // CHECK-NOT: warning:
+@@ -39,6 +42,7 @@
+ // CHECK3-QUIET-NOT: warning:
+ // CHECK4: system-header.h:1:12: warning: single-argument constructors
+ // CHECK4-QUIET: system-header.h:1:12: warning: single-argument constructors
++// CHECK5-NOT: warning:
+ 
+ class A { A(int); };
+ // CHECK: :[[@LINE-1]]:11: warning: single-argument constructors
+@@ -49,6 +53,7 @@
+ // CHECK3-QUIET: :[[@LINE-6]]:11: warning: single-argument constructors
+ // CHECK4: :[[@LINE-7]]:11: warning: single-argument constructors
+ // CHECK4-QUIET: :[[@LINE-8]]:11: warning: single-argument constructors
++// CHECK5: :[[@LINE-9]]:11: warning: single-argument constructors
+ 
+ // CHECK-NOT: warning:
+ // CHECK-QUIET-NOT: warning:
+@@ -58,9 +63,10 @@
+ // CHECK3-QUIET-NOT: warning:
+ // CHECK4-NOT: warning:
+ // CHECK4-QUIET-NOT: warning:
++// CHECK5-NOT: warning:
+ 
+ // CHECK: Suppressed 3 warnings (3 in non-user code)
+-// CHECK: Use -header-filter=.* to display errors from all non-system headers.
++// CHECK: Use -header-filter=.* -exclude-header-filter='' to display errors from all non-system headers.
+ // CHECK-QUIET-NOT: Suppressed
+ // CHECK2: Suppressed 1 warnings (1 in non-user code)
+ // CHECK2: Use -header-filter=.* {{.*}}
+@@ -71,3 +77,5 @@
+ // CHECK4-NOT: Suppressed {{.*}} warnings
+ // CHECK4-NOT: Use -header-filter=.* {{.*}}
+ // CHECK4-QUIET-NOT: Suppressed
++// CHECK5: Suppressed 2 warnings (2 in non-user code)
++// CHECK5: Use -header-filter=.* {{.*}}
